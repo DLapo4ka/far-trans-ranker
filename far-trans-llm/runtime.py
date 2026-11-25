@@ -18,11 +18,16 @@ class LocalGenerator:
         self.device = ('cuda' if torch.cuda.is_available() else 'cpu') if device == 'auto' else device
         if self.device == 'cuda' and not torch.cuda.is_available():
             raise ValueError('CUDA requested but unavailable')
+        if self.device == 'mps':
+            mps = getattr(torch.backends, 'mps', None)
+            if mps is None or not mps.is_available():
+                raise ValueError('MPS requested but unavailable')
         kwargs = {'local_files_only': not allow_download, 'trust_remote_code': False}
         if revision:
             kwargs['revision'] = revision
         self.tokenizer = AutoTokenizer.from_pretrained(model, **kwargs)
-        dtype = torch.bfloat16 if self.device == 'cuda' else torch.float32
+        dtype = (torch.bfloat16 if self.device == 'cuda'
+                 else torch.float16 if self.device == 'mps' else torch.float32)
         self.model = AutoModelForCausalLM.from_pretrained(model, torch_dtype=dtype, **kwargs)
         self.model.to(self.device).eval()
         import transformers
@@ -35,6 +40,12 @@ class LocalGenerator:
                          'do_sample': False, 'thinking': False,
                          'context_limit': 8192}
 
+    def _synchronize(self):
+        if self.device == 'cuda':
+            self.torch.cuda.synchronize()
+        elif self.device == 'mps':
+            self.torch.mps.synchronize()
+
     def generate(self, prompt, max_new_tokens=160):
         messages = [{'role': 'user', 'content': prompt}]
         text = self.tokenizer.apply_chat_template(messages, tokenize=False,
@@ -44,15 +55,13 @@ class LocalGenerator:
         n = inputs['input_ids'].shape[1]
         if n + max_new_tokens > 8192:
             raise ValueError('Prompt exceeds the fixed context budget; reduce candidate/history count')
-        if self.device == 'cuda':
-            self.torch.cuda.synchronize()
+        self._synchronize()
         started = time.perf_counter()
         with self.torch.inference_mode():
             outputs = self.model.generate(**inputs, max_new_tokens=max_new_tokens,
                                           do_sample=False,
                                           pad_token_id=self.tokenizer.eos_token_id)
-        if self.device == 'cuda':
-            self.torch.cuda.synchronize()
+        self._synchronize()
         tokens = outputs[0, n:]
         return {'text': self.tokenizer.decode(tokens, skip_special_tokens=True),
                 'input_tokens': n, 'output_tokens': len(tokens),
